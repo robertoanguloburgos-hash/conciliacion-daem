@@ -1,12 +1,8 @@
 """
-Conciliador de Cartolas BCI
----------------------------
-Aplicación Streamlit que rellena automáticamente la columna 'CARTOLA N°'
-de un Excel de movimientos bancarios, cruzando cada movimiento contra los
-montos extraídos de un PDF consolidado de cartolas oficiales del Banco BCI.
-
-Todo el procesamiento ocurre en memoria (io.BytesIO), sin escritura a disco,
-para ser 100% compatible con Streamlit Community Cloud.
+Conciliador de Cartolas BCI (Corregido)
+----------------------------------------
+Versión adaptada para capturar saltos de línea en el formato oficial BCI
+y corregido para iniciar lectura en la Fila 8 del Excel.
 """
 
 import streamlit as st
@@ -17,48 +13,36 @@ import re
 import io
 from datetime import datetime
 
-# =========================================================================
 # CONFIGURACIÓN DE PÁGINA
-# =========================================================================
 st.set_page_config(
     page_title="Conciliador de Cartolas BCI",
     page_icon="🏦",
     layout="wide"
 )
 
-FILA_ENCABEZADO_DEFECTO = 7  # Fila 7 (1-indexada) = donde están los títulos reales de columnas
+FILA_ENCABEZADO_DEFECTO = 8  # Fila 8 = Donde están los títulos reales en tu Excel
 
-# =========================================================================
-# EXPRESIONES REGULARES
-# =========================================================================
-PATRON_CARTOLA = re.compile(r"CARTOLA\s*N[°ºo]\s*(\d+)", re.IGNORECASE)
+# EXPRESIONES REGULARES CORREGIDAS
+# Usamos [\s\n]* para que capture el número aunque esté en la línea de abajo
+PATRON_CARTOLA = re.compile(r"CARTOLA\s*N[°ºo][\s\n]*(\d+)", re.IGNORECASE)
 PATRON_FECHA = re.compile(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
-# Montos con formato chileno: puntos de miles, coma opcional de decimales
-PATRON_MONTO = re.compile(r"\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+,\d+")
+PATRON_MONTO = re.compile(r"\b\d{1,3}(?:\.\d{3})+(?:,\d+)?\b|\b\d+,\d+\b")
 
-
-# =========================================================================
-# FUNCIONES AUXILIARES DE LIMPIEZA / PARSEO
-# =========================================================================
 def limpiar_monto(texto):
-    """Convierte '33.592.180' o '33.592.180,50' en float. Devuelve None si no es numérico."""
     if texto is None:
         return None
     texto = str(texto).strip()
     if texto in ("", "-", "$"):
         return None
     texto = texto.replace("$", "").strip()
-    texto = texto.replace(".", "")   # quita separador de miles
-    texto = texto.replace(",", ".")  # coma -> punto decimal
+    texto = texto.replace(".", "")   # quita miles
+    texto = texto.replace(",", ".")  # decimal
     try:
-        valor = float(texto)
-        return valor
+        return float(texto)
     except ValueError:
         return None
 
-
 def parsear_fecha(texto):
-    """Intenta parsear una fecha en los formatos comunes usados en cartolas BCI."""
     if texto is None:
         return None
     if isinstance(texto, datetime):
@@ -72,19 +56,7 @@ def parsear_fecha(texto):
             continue
     return None
 
-
-# =========================================================================
-# EXTRACCIÓN DE MOVIMIENTOS DESDE EL PDF
-# =========================================================================
 def extraer_movimientos_pdf(pdf_bytes, progreso_callback=None):
-    """
-    Recorre el PDF página por página. Mantiene una variable de estado con la
-    última 'CARTOLA N° X' detectada, de forma que todas las líneas leídas
-    (incluso en páginas siguientes) se asignan a esa cartola hasta que se
-    detecte una nueva.
-
-    Devuelve un DataFrame con columnas: cartola, fecha, monto, texto_linea
-    """
     registros = []
     cartola_actual = None
 
@@ -94,16 +66,14 @@ def extraer_movimientos_pdf(pdf_bytes, progreso_callback=None):
         for i, pagina in enumerate(pdf.pages):
             texto = pagina.extract_text() or ""
 
-            # Si en esta página aparece "CARTOLA N° X" una o más veces,
-            # actualizamos el estado con la última ocurrencia de la página.
+            # Captura de cartola multi-línea
             coincidencias = PATRON_CARTOLA.findall(texto)
             if coincidencias:
                 cartola_actual = int(coincidencias[-1])
 
             lineas = texto.split("\n")
             for linea in lineas:
-                # No confundir la línea de encabezado de cartola con un movimiento
-                if PATRON_CARTOLA.search(linea):
+                if "CARTOLA N" in linea.upper() and not any(f in linea for f in ["OF VIRT", "OF CENTRA", "PTO MONTT"]):
                     continue
 
                 montos_encontrados = PATRON_MONTO.findall(linea)
@@ -115,7 +85,7 @@ def extraer_movimientos_pdf(pdf_bytes, progreso_callback=None):
 
                 for m in montos_encontrados:
                     valor = limpiar_monto(m)
-                    if valor is not None and valor > 0:
+                    if valor is not None and valor > 100:  # Filtrar números pequeños residuales
                         registros.append({
                             "cartola": cartola_actual,
                             "fecha": fecha_linea,
@@ -128,12 +98,7 @@ def extraer_movimientos_pdf(pdf_bytes, progreso_callback=None):
 
     return pd.DataFrame(registros)
 
-
-# =========================================================================
-# LOCALIZACIÓN DE COLUMNAS EN EL EXCEL
-# =========================================================================
 def encontrar_columnas(ws, fila_encabezado):
-    """Devuelve un dict {nombre_columna: indice_columna_1_indexado}."""
     columnas = {}
     for cell in ws[fila_encabezado]:
         if cell.value is not None:
@@ -141,17 +106,7 @@ def encontrar_columnas(ws, fila_encabezado):
             columnas[nombre] = cell.column
     return columnas
 
-
-# =========================================================================
-# ALGORITMO DE EMPAREJAMIENTO (FIFO + tolerancia de fecha)
-# =========================================================================
-def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_ENCABEZADO_DEFECTO):
-    """
-    Carga el Excel con openpyxl (preserva formato/formulas), busca las
-    columnas relevantes, y para cada fila de movimiento busca un match único
-    en df_pdf por monto exacto + fecha dentro de tolerancia, usando FIFO y
-    un set de índices ya usados para evitar duplicados.
-    """
+def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=4, fila_encabezado=FILA_ENCABEZADO_DEFECTO):
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=False)
     ws = wb.active
 
@@ -171,11 +126,9 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_
 
     if faltantes:
         raise ValueError(
-            "No se encontraron las siguientes columnas esperadas en la fila "
-            f"{fila_encabezado} del Excel: {faltantes}"
+            f"No se encontraron las columnas en la fila {fila_encabezado}. Columnas leídas: {list(columnas.keys())}"
         )
 
-    # Índice rápido: monto redondeado -> lista de índices en df_pdf
     pdf_por_monto = {}
     for idx, fila_pdf in df_pdf.iterrows():
         clave = round(fila_pdf["monto"], 2)
@@ -184,7 +137,6 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_
     used_pdf_indices = set()
     filas_emparejadas = 0
     filas_sin_match = 0
-
     total_filas = ws.max_row
 
     for fila in range(fila_encabezado + 1, total_filas + 1):
@@ -202,7 +154,6 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_
             continue
 
         fecha_excel = parsear_fecha(fecha_val)
-
         candidatos = pdf_por_monto.get(round(abs(monto_excel), 2), [])
 
         match_encontrado = None
@@ -211,13 +162,11 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_
                 continue
 
             fecha_pdf = df_pdf.loc[idx_pdf, "fecha"]
-
             if fecha_excel is not None and fecha_pdf is not None:
                 diferencia_dias = abs((fecha_excel - fecha_pdf).days)
                 if diferencia_dias > tolerancia_dias:
                     continue
 
-            # Primer candidato disponible (FIFO) que cumple la tolerancia
             match_encontrado = idx_pdf
             break
 
@@ -232,24 +181,13 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=3, fila_encabezado=FILA_
     buffer_salida = io.BytesIO()
     wb.save(buffer_salida)
     buffer_salida.seek(0)
-
     return buffer_salida, filas_emparejadas, filas_sin_match
 
-
-# =========================================================================
 # INTERFAZ STREAMLIT
-# =========================================================================
 st.title("🏦 Conciliador de Cartolas BCI")
-st.markdown(
-    """
-    Esta herramienta cruza automáticamente los movimientos del **Excel bancario**
-    contra los montos extraídos del **PDF consolidado de Cartolas Oficiales BCI**,
-    completando la columna **`CARTOLA N°`** según corresponda.
-    """
-)
+st.markdown("Herramienta automatizada de pre-cruce financiero para la visualización y ordenamiento de cartolas.")
 
 st.divider()
-
 col1, col2 = st.columns(2)
 with col1:
     archivo_excel = st.file_uploader("📊 Excel de movimientos bancarios (.xlsx)", type=["xlsx"])
@@ -257,15 +195,8 @@ with col2:
     archivo_pdf = st.file_uploader("📄 PDF consolidado de Cartolas BCI (.pdf)", type=["pdf"])
 
 with st.expander("⚙️ Opciones avanzadas"):
-    fila_encabezado = st.number_input(
-        "Fila donde están los encabezados reales del Excel",
-        min_value=1, max_value=50, value=FILA_ENCABEZADO_DEFECTO,
-        help="Por defecto es la fila 7, según la estructura estándar de la descarga BCI."
-    )
-    tolerancia = st.slider(
-        "Tolerancia de días entre 'Fecha contable' del Excel y la fecha detectada en el PDF",
-        min_value=0, max_value=10, value=3
-    )
+    fila_encabezado = st.number_input("Fila de encabezados reales", min_value=1, value=FILA_ENCABEZADO_DEFECTO)
+    tolerancia = st.slider("Tolerancia de días", min_value=0, max_value=15, value=4)
 
 st.divider()
 
@@ -273,52 +204,21 @@ if archivo_excel and archivo_pdf:
     if st.button("🚀 Procesar y Conciliar", type="primary"):
         pdf_bytes = archivo_pdf.read()
         excel_bytes = archivo_excel.read()
+        barra = st.progress(0, text="Extrayendo datos...")
 
-        barra = st.progress(0, text="Iniciando extracción del PDF...")
+        def actualizar_progreso(act, tot):
+            barra.progress(act / tot, text=f"Leyendo página {act} de {tot}...")
 
-        def actualizar_progreso(actual, total):
-            barra.progress(actual / total, text=f"Leyendo página {actual} de {total} del PDF...")
-
-        with st.spinner("Analizando el PDF de cartolas oficiales..."):
-            df_pdf = extraer_movimientos_pdf(pdf_bytes, progreso_callback=actualizar_progreso)
-
+        df_pdf = extraer_movimientos_pdf(pdf_bytes, progreso_callback=actualizar_progreso)
         barra.empty()
 
         if df_pdf.empty:
-            st.error(
-                "No se pudo extraer ningún movimiento del PDF. Verifica que el archivo "
-                "contenga el texto 'CARTOLA N° X' y montos con formato chileno (ej: 33.592.180)."
-            )
+            st.error("No se detectó información estructurada en el PDF. Inténtalo nuevamente.")
         else:
-            st.success(
-                f"✅ Se extrajeron **{len(df_pdf)}** movimientos pertenecientes a "
-                f"**{df_pdf['cartola'].nunique()}** cartolas distintas."
-            )
-
-            with st.spinner("Emparejando movimientos del Excel con el PDF..."):
-                try:
-                    buffer_resultado, emparejadas, sin_match = procesar_excel(
-                        excel_bytes, df_pdf,
-                        tolerancia_dias=tolerancia,
-                        fila_encabezado=int(fila_encabezado)
-                    )
-                except ValueError as e:
-                    st.error(f"❌ {e}")
-                    st.stop()
-
-            st.success(
-                f"🎯 Proceso completado: **{emparejadas}** filas emparejadas, "
-                f"**{sin_match}** filas sin coincidencia."
-            )
-
-            st.download_button(
-                label="⬇️ Descargar Excel con CARTOLA N° completada",
-                data=buffer_resultado,
-                file_name="movimientos_bancarios_con_cartola.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-            with st.expander("🔍 Ver detalle de movimientos extraídos del PDF"):
-                st.dataframe(df_pdf, use_container_width=True)
-else:
-    st.info("⬆️ Sube ambos archivos (Excel y PDF) para habilitar el procesamiento.")
+            st.success(f"✅ Se procesaron {len(df_pdf)} movimientos en {df_pdf['cartola'].nunique()} cartolas.")
+            try:
+                buf, ok, nok = procesar_excel(excel_bytes, df_pdf, tolerancia_dias=tolerancia, fila_encabezado=int(fila_encabezado))
+                st.success(f"🎯 Cruce exitoso: {ok} emparejados, {nok} sin match.")
+                st.download_button("⬇️ Descargar Excel Completado", data=buf, file_name="movimientos_bancarios_con_cartola.xlsx")
+            except Exception as e:
+                st.error(f"Error en procesamiento: {e}")
