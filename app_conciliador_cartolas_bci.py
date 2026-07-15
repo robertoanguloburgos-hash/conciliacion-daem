@@ -1,5 +1,5 @@
 """
-Conciliador de Cartolas BCI (Versión Excel a Excel)
+Conciliador de Cartolas BCI (Excel a Excel - Corregido)
 ---------------------------------------------------
 Cruce directo de planillas para máxima velocidad y precisión.
 Elimina la necesidad de procesar archivos PDF.
@@ -53,7 +53,6 @@ def mapear_cartola_por_fecha(fecha_contable):
     """
     if not fecha_contable:
         return 1
-    # Mapeo exacto de rangos de días del mes de Enero según cierres oficiales
     dia = fecha_contable.day
     mes = fecha_contable.month
     
@@ -73,7 +72,7 @@ def mapear_cartola_por_fecha(fecha_contable):
         elif dia <= 28: return 13
         elif dia <= 29: return 14
         else: return 15
-    return mes + 14  # Correlativo estimado para meses posteriores (Febrero en adelante)
+    return mes + 14  
 
 def extraer_movimientos_cartola_convertida(archivo_convertido):
     """Lee las filas de la cartola convertida a Excel y extrae folios y saldos."""
@@ -81,7 +80,6 @@ def extraer_movimientos_cartola_convertida(archivo_convertido):
     movimientos_banco = []
     
     for idx, row in df_raw.iterrows():
-        # Saltarse filas vacías o de resúmenes de periodos
         desc = str(row.iloc[2]).upper() if pd.notna(row.iloc[2]) else ""
         if "RESUMEN" in desc or "PERIODO" in desc or "RETENCIONES" in desc:
             continue
@@ -109,7 +107,7 @@ def extraer_movimientos_cartola_convertida(archivo_convertido):
         
     return pd.DataFrame(movimientos_banco)
 
-def procesar_cruce_excel(excel_control_bytes, df_banco, fila_encabezado=FILA_ENCABEZADO_DEFECTO):
+def procesar_excel(excel_control_bytes, df_banco, fila_encabezado=FILA_ENCABEZADO_DEFECTO):
     wb = openpyxl.load_workbook(io.BytesIO(excel_control_bytes), data_only=False)
     ws = wb.active
 
@@ -129,6 +127,14 @@ def procesar_cruce_excel(excel_control_bytes, df_banco, fila_encabezado=FILA_ENC
     if not col_cartola:
         for k, v in columnas.items():
             if "CARTOLA" in k: col_cartola = v
+
+    faltantes = [n for n, idx in [
+        ("Fecha contable (*)", col_fecha), ("Cargo (-)", col_cargo), 
+        ("Abono (+)", col_abono), ("CARTOLA N°", col_cartola)
+    ] if idx is None]
+
+    if faltantes:
+        raise ValueError(f"Faltan columnas requeridas en la Fila {fila_encabezado}. Detectadas: {list(columnas.keys())}")
 
     used_banco_indices = set()
     emparejados = 0
