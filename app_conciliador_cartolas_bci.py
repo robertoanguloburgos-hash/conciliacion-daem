@@ -1,13 +1,12 @@
 """
-Conciliador de Cartolas BCI (Versión Robustecida)
-------------------------------------------------
-Filtros Regex flexibilizados al máximo para capturar montos sin puntos (ej: 995)
-y variaciones en el formato de títulos del Banco BCI.
+Conciliador de Cartolas BCI (Versión Multimes - MultiPDF)
+--------------------------------------------------------
+Soporta la carga de múltiples archivos PDF simultáneamente. Cruza por número 
+de documento y saldos diarios de control para máxima precisión contable.
 """
 
 import streamlit as st
 import pandas as pd
-import pdfplumber
 import openpyxl
 import re
 import io
@@ -20,15 +19,18 @@ st.set_page_config(
     layout="wide"
 )
 
-FILA_ENCABEZADO_DEFECTO = 8  # Fila donde están los encabezados reales en tu Excel
+FILA_ENCABEZADO_DEFECTO = 8  # Fila estándar donde parten las columnas en tu Excel
 
-# EXPRESIONES REGULARES ULTRA-FLEXIBLES (CORREGIDAS)
-# Captura "CARTOLA N° 1", "CARTOLA N°\n1", "CARTOLA 1", etc.
+# EXPRESIONES REGULARES DE EXTRACCIÓN
 PATRON_CARTOLA = re.compile(r"CARTOLA[\s\n]*N*[°ºo\.]*[\s\n]*(\d+)", re.IGNORECASE)
 PATRON_FECHA = re.compile(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})")
-
-# Captura tanto montos con puntos (5.192.999) como montos planos de 3 dígitos (995)
 PATRON_MONTO = re.compile(r"\b\d{1,3}(?:\.\d{3})+(?:,\d+)?\b|\b\d+(?:,\d+)?\b")
+
+# Intentar importar pdfplumber de manera segura en Streamlit Cloud
+try:
+    import pdfplumber
+except ImportError:
+    st.error("Falta instalar la librería 'pdfplumber'. Asegúrate de que esté escrita en tu archivo requirements.txt")
 
 def limpiar_monto(texto):
     if texto is None:
@@ -37,8 +39,8 @@ def limpiar_monto(texto):
     if texto in ("", "-", "$"):
         return None
     texto = texto.replace("$", "").strip()
-    texto = texto.replace(".", "")   # quita puntos de miles
-    texto = texto.replace(",", ".")  # maneja comas decimales
+    texto = texto.replace(".", "")   # Elimina puntos de miles
+    texto = texto.replace(",", ".")  # Convierte coma decimal a punto
     try:
         return float(texto)
     except ValueError:
@@ -58,48 +60,60 @@ def parsear_fecha(texto):
             continue
     return None
 
-def extraer_movimientos_pdf(pdf_bytes, progreso_callback=None):
+def extraer_datos_de_lista_pdfs(lista_archivos_pdf, progreso_bar):
+    """Procesa una lista de archivos PDF cargados por el usuario."""
     registros = []
-    cartola_actual = None
+    total_archivos = len(lista_archivos_pdf)
+    
+    for idx_arch, archivo in enumerate(lista_archivos_pdf):
+        cartola_actual = None
+        # Leer el archivo en memoria de forma segura
+        pdf_bytes = archivo.read()
+        
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, pagina in enumerate(pdf.pages):
+                texto = pagina.extract_text() or ""
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        total_paginas = len(pdf.pages)
+                # Identificar número de cartola de esta sección del PDF
+                coincidencias = PATRON_CARTOLA.findall(texto)
+                if coincidencias:
+                    cartola_actual = int(coincidencias[-1])
 
-        for i, pagina in enumerate(pdf.pages):
-            texto = pagina.extract_text() or ""
+                lineas = texto.split("\n")
+                for linea in lineas:
+                    if "CASILLA 136-D" in linea or "GERENCIA DE CLIENTES" in linea:
+                        continue
 
-            # Buscar número de cartola en la página de forma flexible
-            coincidencias = PATRON_CARTOLA.findall(texto)
-            if coincidencias:
-                cartola_actual = int(coincidencias[-1])
+                    montos_encontrados = PATRON_MONTO.findall(linea)
+                    if not montos_encontrados:
+                        continue
 
-            lineas = texto.split("\n")
-            for linea in lineas:
-                # Evitar procesar líneas de títulos institucionales o firmas
-                if "CASILLA 136-D" in linea or "GERENCIA DE CLIENTES" in linea:
-                    continue
+                    fechas_encontradas = PATRON_FECHA.findall(linea)
+                    fecha_linea = parsear_fecha(fechas_encontradas[0]) if fechas_encontradas else None
 
-                montos_encontrados = PATRON_MONTO.findall(linea)
-                if not montos_encontrados:
-                    continue
+                    # Buscar un número de documento largo si existe en la línea (típico de BCI)
+                    doc_match = re.search(r"\b(96\d{7}|\d{7})\b", linea)
+                    num_doc_pdf = int(doc_match.group(1)) if doc_match else None
 
-                fechas_encontradas = PATRON_FECHA.findall(linea)
-                fecha_linea = parsear_fecha(fechas_encontradas[0]) if fechas_encontradas else None
+                    # Rastrear el saldo diario al final de la línea para control cruzado cruzando con Excel
+                    saldo_diario_banco = None
+                    if len(montos_encontrados) >= 2:
+                        saldo_diario_banco = limpiar_monto(montos_encontrados[-1])
 
-                for m in montos_encontrados:
-                    valor = limpiar_monto(m)
-                    # Excluir números que parezcan años, códigos de oficina o RUTs comunes en la glosa
-                    if valor is not None and valor > 100 and valor not in [2025, 2026, 60358858]:
-                        registros.append({
-                            "cartola": cartola_actual if cartola_actual is not None else 1, # Respaldar con Cartola 1 si no lee el tope
-                            "fecha": fecha_linea,
-                            "monto": valor,
-                            "texto_linea": linea.strip()
-                        })
-
-            if progreso_callback:
-                progreso_callback(i + 1, total_paginas)
-
+                    for m in montos_encontrados[:-1] if len(montos_encontrados) > 1 else montos_encontrados:
+                        valor = limpiar_monto(m)
+                        if valor is not None and valor > 100 and valor not in [2025, 2026]:
+                            registros.append({
+                                "cartola": cartola_actual if cartola_actual is not None else 1,
+                                "fecha": fecha_linea,
+                                "monto": valor,
+                                "documento": num_doc_pdf,
+                                "saldo_diario": saldo_diario_banco,
+                                "texto_linea": linea.strip()
+                            })
+                            
+        progreso_bar.progress((idx_arch + 1) / total_archivos, text=f"Procesado archivo {idx_arch + 1} de {total_archivos}: {archivo.name}")
+        
     return pd.DataFrame(registros)
 
 def encontrar_columnas(ws, fila_encabezado):
@@ -117,33 +131,24 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=4, fila_encabezado=FILA_
     columnas = encontrar_columnas(ws, fila_encabezado)
 
     col_fecha = columnas.get("Fecha contable (*)")
+    col_doc = columnas.get("N° documento")
     col_cargo = columnas.get("Cargo (-)")
     col_abono = columnas.get("Abono (+)")
+    col_saldo = columnas.get("SALDOS")
     col_cartola = columnas.get("CARTOLA N°")
 
-    if not col_cartola and "CARTOLA N" in [str(k)[:9] for k in columnas.keys()]:
-        # Parche por si tiene un espacio extraño al final
+    # Parche de seguridad para nombres de columnas con espacios invisibles
+    if not col_cartola:
         for k, v in columnas.items():
-            if "CARTOLA" in k:
-                col_cartola = v
+            if "CARTOLA" in k: col_cartola = v
 
-    faltantes = [nombre for nombre, idx in [
-        ("Fecha contable (*)", col_fecha),
-        ("Cargo (-)", col_cargo),
-        ("Abono (+)", col_abono),
-        ("CARTOLA N°", col_cartola),
+    faltantes = [n for n, idx in [
+        ("Fecha contable (*)", col_fecha), ("Cargo (-)", col_cargo), 
+        ("Abono (+)", col_abono), ("CARTOLA N°", col_cartola)
     ] if idx is None]
 
     if faltantes:
-        raise ValueError(
-            f"Faltan columnas requeridas en la Fila {fila_encabezado}. Detectadas: {list(columnas.keys())}"
-        )
-
-    # Agrupar PDF por montos para búsqueda rápida
-    pdf_por_monto = {}
-    for idx, fila_pdf in df_pdf.iterrows():
-        clave = round(fila_pdf["monto"], 2)
-        pdf_por_monto.setdefault(clave, []).append(idx)
+        raise ValueError(f"Faltan columnas requeridas en la Fila {fila_encabezado}: {faltantes}")
 
     used_pdf_indices = set()
     filas_emparejadas = 0
@@ -154,6 +159,8 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=4, fila_encabezado=FILA_
         cargo_val = ws.cell(row=fila, column=col_cargo).value
         abono_val = ws.cell(row=fila, column=col_abono).value
         fecha_val = ws.cell(row=fila, column=col_fecha).value
+        doc_val = ws.cell(row=fila, column=col_doc).value if col_doc else None
+        saldo_val = ws.cell(row=fila, column=col_saldo).value if col_saldo else None
 
         monto_excel = None
         if cargo_val not in (None, "", 0):
@@ -165,26 +172,46 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=4, fila_encabezado=FILA_
             continue
 
         fecha_excel = parsear_fecha(fecha_val)
-        candidatos = pdf_por_monto.get(round(abs(monto_excel), 2), [])
+        num_doc_excel = int(doc_val) if isinstance(doc_val, (int, float)) and doc_val > 0 else None
+        val_saldo_excel = float(saldo_val) if isinstance(saldo_val, (int, float)) else limpiar_monto(saldo_val)
 
         match_encontrado = None
-        for idx_pdf in candidatos:
-            if idx_pdf in used_pdf_indices:
-                continue
 
-            fecha_pdf = df_pdf.loc[idx_pdf, "fecha"]
-            if fecha_excel is not None and fecha_pdf is not None:
-                diferencia_dias = abs((fecha_excel - fecha_pdf).days)
-                if diferencia_dias > tolerancia_dias:
-                    continue
+        # ESTRATEGIA 1: Match por Número de Documento exacto (Altísima precisión)
+        if num_doc_excel is not None:
+            candidatos_doc = df_pdf[(df_pdf["documento"] == num_doc_excel) & (~df_pdf.index.isin(used_pdf_indices))]
+            if not candidatos_doc.empty:
+                match_encontrado = candidatos_doc.index[0]
 
-            match_encontrado = idx_pdf
-            break
+        # ESTRATEGIA 2: Match por Monto + Tolerancia de Fecha + Control de Saldo Diario
+        if match_encontrado is None:
+            candidatos_monto = df_pdf[(df_pdf["monto"] == round(abs(monto_excel), 2)) & (~df_pdf.index.isin(used_pdf_indices))]
+            
+            for idx_pdf, fila_pdf in candidatos_monto.iterrows():
+                # Validar rango de fecha contable
+                fecha_pdf = fila_pdf["fecha"]
+                if fecha_excel is not None and fecha_pdf is not None:
+                    if abs((fecha_excel - fecha_pdf).days) > tolerancia_dias:
+                        continue
+                
+                # Si tenemos el saldo diario de control del BCI, lo usamos para desempatar montos repetidos
+                if val_saldo_excel is not None and fila_pdf["saldo_diario"] is not None:
+                    if round(val_saldo_excel, 0) != round(fila_pdf["saldo_diario"], 0):
+                        continue
+
+                match_encontrado = idx_pdf
+                break
+
+        # Si aún no hay match, tiramos una búsqueda secuencial simple por monto bruto (FIFO fallback)
+        if match_encontrado is None and num_doc_excel is None:
+            candidatos_fallback = df_pdf[(df_pdf["monto"] == round(abs(monto_excel), 2)) & (~df_pdf.index.isin(used_pdf_indices))]
+            if not candidatos_fallback.empty:
+                match_encontrado = candidatos_fallback.index[0]
 
         if match_encontrado is not None:
             used_pdf_indices.add(match_encontrado)
-            numero_cartola = df_pdf.loc[match_encontrado, "cartola"]
-            ws.cell(row=fila, column=col_cartola).value = f"CARTOLA {numero_cartola}"
+            num_cartola = df_pdf.loc[match_encontrado, "cartola"]
+            ws.cell(row=fila, column=col_cartola).value = f"CARTOLA {num_cartola}"
             filas_emparejadas += 1
         else:
             filas_sin_match += 1
@@ -194,42 +221,40 @@ def procesar_excel(excel_bytes, df_pdf, tolerancia_dias=4, fila_encabezado=FILA_
     buffer_salida.seek(0)
     return buffer_salida, filas_emparejadas, filas_sin_match
 
-# INTERFAZ STREAMLIT
-st.title("🏦 Conciliador de Cartolas BCI")
-st.markdown("Herramienta automatizada de pre-cruce financiero para la Ilustre Municipalidad de Puerto Montt.")
+# UI DE STREAMLIT
+st.title("🏦 Conciliador de Cartolas BCI (Multimes)")
+st.markdown("Carga tu Excel consolidado y **todos los PDFs de cartolas mensuales** al mismo tiempo para automatizar el pre-cruce.")
 
 st.divider()
-col1, col2 = st.columns(2)
-with col1:
-    archivo_excel = st.file_uploader("📊 Excel de movimientos bancarios (.xlsx)", type=["xlsx"])
-with col2:
-    archivo_pdf = st.file_uploader("📄 PDF consolidado de Cartolas BCI (.pdf)", type=["pdf"])
+archivo_excel = st.file_uploader("📊 Subir el Excel de movimientos bancarios (.xlsx)", type=["xlsx"])
+archivos_pdf = st.file_uploader("📄 Subir Cartolas PDF (Puedes seleccionar los 6 archivos juntos)", type=["pdf"], accept_multiple_files=True)
 
-with st.expander("⚙️ Opciones avanzadas"):
-    fila_encabezado = st.number_input("Fila de encabezados reales (donde dice 'Fecha transacción')", min_value=1, value=FILA_ENCABEZADO_DEFECTO)
-    tolerancia = st.slider("Tolerancia máxima de días (desfase de fechas banco/sistema)", min_value=0, max_value=15, value=4)
+with st.expander("⚙️ Ajustes de tolerancia"):
+    fila_encabezado = st.number_input("Fila de nombres de columnas (donde dice 'Fecha transacción')", min_value=1, value=FILA_ENCABEZADO_DEFECTO)
+    tolerancia = st.slider("Margen de desfase de fechas (Días)", min_value=0, max_value=20, value=4)
 
 st.divider()
 
-if archivo_excel and archivo_pdf:
-    if st.button("🚀 Procesar y Conciliar", type="primary"):
-        pdf_bytes = archivo_pdf.read()
+if archivo_excel and archivos_pdf:
+    if st.button("🚀 Iniciar Conciliación Cruzada", type="primary"):
         excel_bytes = archivo_excel.read()
-        barra = st.progress(0, text="Analizando PDF...")
-
-        def actualizar_progreso(act, tot):
-            barra.progress(act / tot, text=f"Procesando página {act} de {tot}...")
-
-        df_pdf = extraer_movimientos_pdf(pdf_bytes, progreso_callback=actualizar_progreso)
-        barra.empty()
+        
+        barra_progreso = st.progress(0, text="Iniciando lectura de los PDFs...")
+        
+        with st.spinner("Extrayendo movimientos de todas las cartolas del banco..."):
+            df_pdf = extraer_datos_de_lista_pdfs(archivos_pdf, barra_progreso)
+            
+        barra_progreso.empty()
 
         if df_pdf.empty:
-            st.error("No se detectó información en el PDF. Verifica que sea un PDF de texto legible y no escaneado como imagen.")
+            st.error("No se pudo estructurar la información de los PDFs. Revisa que no sean imágenes escaneadas sin texto.")
         else:
-            st.success(f"✅ Éxito: Se extrajeron {len(df_pdf)} movimientos del PDF de Cartolas.")
-            try:
-                buf, ok, nok = procesar_excel(excel_bytes, df_pdf, tolerancia_dias=tolerancia, fila_encabezado=int(fila_encabezado))
-                st.success(f"🎯 Cruce finalizado: {ok} filas emparejadas con su Cartola. {nok} filas sin coincidencia.")
-                st.download_button("📥 Descargar Excel Completado", data=buf, file_name="movimientos_bancarios_con_cartola.xlsx")
-            except Exception as e:
-                st.error(f"Error durante el cruce con el Excel: {e}")
+            st.success(f"✅ Se han procesado con éxito {len(df_pdf)} líneas de transacciones en los documentos bancarios.")
+            
+            with st.spinner("Rellenando columna de Cartolas en tu Excel..."):
+                try:
+                    buf, ok, nok = procesar_excel(excel_bytes, df_pdf, tolerancia_dias=tolerancia, fila_encabezado=int(fila_encabezado))
+                    st.success(f"🎯 ¡Pre-cruce finalizado! Filas asignadas con éxito: {ok}. Filas sin match en los PDF subidos: {nok}.")
+                    st.download_button("📥 Descargar Excel con CARTOLA N°", data=buf, file_name="movimientos_bancarios_con_cartola.xlsx")
+                except Exception as e:
+                    st.error(f"Error al escribir los datos en las celdas: {e}")
